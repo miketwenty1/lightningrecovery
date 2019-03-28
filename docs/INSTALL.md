@@ -35,31 +35,31 @@
 
     (x86-64)
     ```
-    wget https://dl.google.com/go/go1.11.4.linux-amd64.tar.gz
-    sha256sum go1.11.4.linux-amd64.tar.gz | awk -F " " '{ print $1 }'
+    wget https://dl.google.com/go/go1.11.5.linux-amd64.tar.gz
+    sha256sum go1.11.5.linux-amd64.tar.gz | awk -F " " '{ print $1 }'
     ```
 
     The final output of the command above should be
-    `fb26c30e6a04ad937bbc657a1b5bba92f80096af1e8ee6da6430c045a8db3a5b`. If it
+    `ff54aafedff961eb94792487e827515da683d61a5f9482f668008832631e5d25`. If it
     isn't, then the target REPO HAS BEEN MODIFIED, and you shouldn't install
     this version of Go. If it matches, then proceed to install Go:
     ```
-    tar -C /usr/local -xzf go1.11.4.linux-amd64.tar.gz
+    tar -C /usr/local -xzf go1.11.5.linux-amd64.tar.gz
     export PATH=$PATH:/usr/local/go/bin
     ```
 
     (ARMv6)
     ```
-    wget https://dl.google.com/go/go1.11.4.linux-armv6l.tar.gz
-    sha256sum go1.11.4.linux-armv6l.tar.gz | awk -F " " '{ print $1 }'
+    wget https://dl.google.com/go/go1.11.5.linux-armv6l.tar.gz
+    sha256sum go1.11.5.linux-armv6l.tar.gz | awk -F " " '{ print $1 }'
     ```
 
     The final output of the command above should be
-    `9f7a71d27fef69f654a93e265560c8d9db1a2ca3f1dcdbe5288c46facfde5821`. If it
+    `b26b53c94923f78955236386fee0725ef4e76b6cb47e0df0ed0c0c4724e7b198`. If it
     isn't, then the target REPO HAS BEEN MODIFIED, and you shouldn't install
     this version of Go. If it matches, then proceed to install Go:
     ```
-    tar -C /usr/local -xzf go1.11.4.linux-armv6l.tar.gz
+    tar -C /usr/local -xzf go1.11.5.linux-armv6l.tar.gz
     export PATH=$PATH:/usr/local/go/bin
     ```
 
@@ -277,8 +277,8 @@ lnd --bitcoin.active --bitcoin.testnet --debuglevel=debug --btcd.rpcuser=kek --b
 
 In order to run `lnd` in its light client mode, you'll need to locate a
 full-node which is capable of serving this new light client mode. `lnd` uses
-[BIP 157](https://github.com/bitcoin/bips/tree/master/bip-0157) and [BIP
-158](https://github.com/bitcoin/bips/tree/master/bip-0158) for its light client
+[BIP 157](https://github.com/bitcoin/bips/blob/master/bip-0157.mediawiki) and [BIP
+158](https://github.com/bitcoin/bips/blob/master/bip-0158.mediawiki) for its light client
 mode.  A public instance of such a node can be found at
 `faucet.lightning.community`.
 

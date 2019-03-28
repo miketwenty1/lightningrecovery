@@ -12,7 +12,7 @@ import (
 	"github.com/lightningnetwork/lnd/chainntnfs"
 	"github.com/lightningnetwork/lnd/channeldb"
 	"github.com/lightningnetwork/lnd/input"
-	"github.com/lightningnetwork/lnd/lntypes"
+	"github.com/lightningnetwork/lnd/invoices"
 	"github.com/lightningnetwork/lnd/lnwallet"
 	"github.com/lightningnetwork/lnd/lnwire"
 	"github.com/lightningnetwork/lnd/sweep"
@@ -137,10 +137,9 @@ type ChainArbitratorConfig struct {
 	// Sweeper allows resolvers to sweep their final outputs.
 	Sweeper *sweep.UtxoSweeper
 
-	// SettleInvoice attempts to settle an existing invoice on-chain with
-	// the given payment hash. ErrInvoiceNotFound is returned if an invoice
-	// is not found.
-	SettleInvoice func(lntypes.Hash, lnwire.MilliSatoshi) error
+	// Registry is the invoice database that is used by resolvers to lookup
+	// preimages and settle invoices.
+	Registry *invoices.InvoiceRegistry
 
 	// NotifyClosedChannel is a function closure that the ChainArbitrator
 	// will use to notify the ChannelNotifier about a newly closed channel.
@@ -228,25 +227,37 @@ func newActiveChannelArbitrator(channel *channeldb.OpenChannel,
 		ShortChanID: channel.ShortChanID(),
 		BlockEpochs: blockEpoch,
 		ForceCloseChan: func() (*lnwallet.LocalForceCloseSummary, error) {
-			// With the channels fetched, attempt to locate
-			// the target channel according to its channel
-			// point.
+			// First, we mark the channel as borked, this ensure
+			// that no new state transitions can happen, and also
+			// that the link won't be loaded into the switch.
+			if err := channel.MarkBorked(); err != nil {
+				return nil, err
+			}
+
+			// With the channel marked as borked, we'll now remove
+			// the link from the switch if its there. If the link
+			// is active, then this method will block until it
+			// exits.
+			if err := c.cfg.MarkLinkInactive(chanPoint); err != nil {
+				log.Errorf("unable to mark link inactive: %v", err)
+			}
+
+			// Now that we know the link can't mutate the channel
+			// state, we'll read the channel from disk the target
+			// channel according to its channel point.
 			channel, err := c.chanSource.FetchChannel(chanPoint)
 			if err != nil {
 				return nil, err
 			}
 
+			// Finally, we'll force close the channel completing
+			// the force close workflow.
 			chanMachine, err := lnwallet.NewLightningChannel(
 				c.cfg.Signer, c.cfg.PreimageDB, channel, nil,
 			)
 			if err != nil {
 				return nil, err
 			}
-
-			if err := c.cfg.MarkLinkInactive(chanPoint); err != nil {
-				log.Errorf("unable to mark link inactive: %v", err)
-			}
-
 			return chanMachine.ForceClose()
 		},
 		MarkCommitmentBroadcasted: channel.MarkCommitmentBroadcasted,
@@ -364,6 +375,7 @@ func (c *ChainArbitrator) Start() error {
 				contractBreach: func(retInfo *lnwallet.BreachRetribution) error {
 					return c.cfg.ContractBreach(chanPoint, retInfo)
 				},
+				extractStateNumHint: lnwallet.GetStateNumHint,
 			},
 		)
 		if err != nil {
@@ -625,6 +637,14 @@ func (c *ChainArbitrator) ForceCloseContract(chanPoint wire.OutPoint) (*wire.Msg
 
 	log.Infof("Attempting to force close ChannelPoint(%v)", chanPoint)
 
+	// Before closing, we'll attempt to send a disable update for the
+	// channel. We do so before closing the channel as otherwise the current
+	// edge policy won't be retrievable from the graph.
+	if err := c.cfg.DisableChannel(chanPoint); err != nil {
+		log.Warnf("Unable to disable channel %v on "+
+			"close: %v", chanPoint, err)
+	}
+
 	errChan := make(chan error, 1)
 	respChan := make(chan *wire.MsgTx, 1)
 
@@ -656,16 +676,6 @@ func (c *ChainArbitrator) ForceCloseContract(chanPoint wire.OutPoint) (*wire.Msg
 	case <-c.quit:
 		return nil, ErrChainArbExiting
 	}
-
-	// We'll attempt to disable the channel in the background to
-	// avoid blocking due to sending the update message to all
-	// active peers.
-	go func() {
-		if err := c.cfg.DisableChannel(chanPoint); err != nil {
-			log.Errorf("Unable to disable channel %v on "+
-				"close: %v", chanPoint, err)
-		}
-	}()
 
 	return closeTx, nil
 }
@@ -700,6 +710,7 @@ func (c *ChainArbitrator) WatchNewChannel(newChan *channeldb.OpenChannel) error 
 			contractBreach: func(retInfo *lnwallet.BreachRetribution) error {
 				return c.cfg.ContractBreach(chanPoint, retInfo)
 			},
+			extractStateNumHint: lnwallet.GetStateNumHint,
 		},
 	)
 	if err != nil {

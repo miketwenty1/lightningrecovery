@@ -20,6 +20,7 @@ import (
 	"github.com/golang/protobuf/jsonpb"
 	"github.com/golang/protobuf/proto"
 	"github.com/lightningnetwork/lnd/lnrpc"
+	"github.com/lightningnetwork/lnd/walletunlocker"
 	"github.com/urfave/cli"
 	"golang.org/x/crypto/ssh/terminal"
 	"golang.org/x/net/context"
@@ -32,7 +33,7 @@ import (
 
 // TODO(roasbeef): expose all fee conf targets
 
-const defaultRecoveryWindow int32 = 250
+const defaultRecoveryWindow int32 = 2500
 
 func printJSON(resp interface{}) {
 	b, err := json.Marshal(resp)
@@ -140,6 +141,52 @@ func newAddress(ctx *cli.Context) error {
 	}
 
 	printRespJSON(addr)
+	return nil
+}
+
+var estimateFeeCommand = cli.Command{
+	Name:      "estimatefee",
+	Category:  "On-chain",
+	Usage:     "Get fee estimates for sending bitcoin on-chain to multiple addresses.",
+	ArgsUsage: "send-json-string [--conf_target=N]",
+	Description: `
+	Get fee estimates for sending a transaction paying the specified amount(s) to the passed address(es).
+
+	The send-json-string' param decodes addresses and the amount to send respectively in the following format:
+
+	    '{"ExampleAddr": NumCoinsInSatoshis, "SecondAddr": NumCoins}'
+	`,
+	Flags: []cli.Flag{
+		cli.Int64Flag{
+			Name: "conf_target",
+			Usage: "(optional) the number of blocks that the transaction *should* " +
+				"confirm in",
+		},
+	},
+	Action: actionDecorator(estimateFees),
+}
+
+func estimateFees(ctx *cli.Context) error {
+	var amountToAddr map[string]int64
+
+	jsonMap := ctx.Args().First()
+	if err := json.Unmarshal([]byte(jsonMap), &amountToAddr); err != nil {
+		return err
+	}
+
+	ctxb := context.Background()
+	client, cleanUp := getClient(ctx)
+	defer cleanUp()
+
+	resp, err := client.EstimateFee(ctxb, &lnrpc.EstimateFeeRequest{
+		AddrToAmount: amountToAddr,
+		TargetConf:   int32(ctx.Int64("conf_target")),
+	})
+	if err != nil {
+		return err
+	}
+
+	printRespJSON(resp)
 	return nil
 }
 
@@ -265,7 +312,7 @@ var listUnspentCommand = cli.Command{
 	confirmations.  Use --min_confs=0 to include unconfirmed coins. To list
 	all coins with at least min_confs confirmations, omit the second
 	argument or flag '--max_confs'. To list all confirmed and unconfirmed
-	coins, no arguments are required. To see only unconfirmed coins, use 
+	coins, no arguments are required. To see only unconfirmed coins, use
 	'--unconfirmed_only' with '--min_confs' and '--max_confs' set to zero or
 	not present.
 	`,
@@ -1334,6 +1381,13 @@ func create(ctx *cli.Context) error {
 		return fmt.Errorf("passwords don't match")
 	}
 
+	// If the password length is less than 8 characters, then we'll
+	// return an error.
+	pwErr := walletunlocker.ValidatePassword(pw1)
+	if pwErr != nil {
+		return pwErr
+	}
+
 	// Next, we'll see if the user has 24-word mnemonic they want to use to
 	// derive a seed within the wallet.
 	var (
@@ -1900,6 +1954,12 @@ func closedChannels(ctx *cli.Context) error {
 	return nil
 }
 
+var cltvLimitFlag = cli.UintFlag{
+	Name: "cltv_limit",
+	Usage: "the maximum time lock that may be used for " +
+		"this payment",
+}
+
 var sendPaymentCommand = cli.Command{
 	Name:     "sendpayment",
 	Category: "Payments",
@@ -1946,6 +2006,7 @@ var sendPaymentCommand = cli.Command{
 			Usage: "percentage of the payment's amount used as the" +
 				"maximum fee allowed when sending the payment",
 		},
+		cltvLimitFlag,
 		cli.StringFlag{
 			Name:  "payment_hash, r",
 			Usage: "the hash to use within the payment's HTLC",
@@ -2065,6 +2126,7 @@ func sendPayment(ctx *cli.Context) error {
 			Amt:            ctx.Int64("amt"),
 			FeeLimit:       feeLimit,
 			OutgoingChanId: ctx.Uint64("outgoing_chan_id"),
+			CltvLimit:      uint32(ctx.Int(cltvLimitFlag.Name)),
 		}
 
 		return sendPaymentRequest(client, req)
@@ -2121,6 +2183,7 @@ func sendPayment(ctx *cli.Context) error {
 			rHash, err = hex.DecodeString(ctx.String("payment_hash"))
 		case args.Present():
 			rHash, err = hex.DecodeString(args.First())
+			args = args.Tail()
 		default:
 			return fmt.Errorf("payment hash argument missing")
 		}
@@ -2211,6 +2274,7 @@ var payInvoiceCommand = cli.Command{
 			Usage: "percentage of the payment's amount used as the" +
 				"maximum fee allowed when sending the payment",
 		},
+		cltvLimitFlag,
 		cli.Uint64Flag{
 			Name: "outgoing_chan_id",
 			Usage: "short channel id of the outgoing channel to " +
@@ -2257,7 +2321,9 @@ func payInvoice(ctx *cli.Context) error {
 		Amt:            ctx.Int64("amt"),
 		FeeLimit:       feeLimit,
 		OutgoingChanId: ctx.Uint64("outgoing_chan_id"),
+		CltvLimit:      uint32(ctx.Int(cltvLimitFlag.Name)),
 	}
+
 	return sendPaymentRequest(client, req)
 }
 

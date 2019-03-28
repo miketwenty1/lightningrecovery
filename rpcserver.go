@@ -2,7 +2,6 @@ package main
 
 import (
 	"bytes"
-	"crypto/rand"
 	"crypto/sha256"
 	"crypto/tls"
 	"encoding/hex"
@@ -17,6 +16,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/lightningnetwork/lnd/lnrpc/routerrpc"
+
 	"github.com/btcsuite/btcd/blockchain"
 	"github.com/btcsuite/btcd/btcec"
 	"github.com/btcsuite/btcd/chaincfg/chainhash"
@@ -24,6 +25,7 @@ import (
 	"github.com/btcsuite/btcd/wire"
 	"github.com/btcsuite/btcutil"
 	"github.com/btcsuite/btcwallet/waddrmgr"
+	"github.com/btcsuite/btcwallet/wallet/txauthor"
 	"github.com/coreos/bbolt"
 	"github.com/davecgh/go-spew/spew"
 	proxy "github.com/grpc-ecosystem/grpc-gateway/runtime"
@@ -37,6 +39,7 @@ import (
 	"github.com/lightningnetwork/lnd/lncfg"
 	"github.com/lightningnetwork/lnd/lnrpc"
 	"github.com/lightningnetwork/lnd/lnrpc/invoicesrpc"
+	"github.com/lightningnetwork/lnd/lntypes"
 	"github.com/lightningnetwork/lnd/lnwallet"
 	"github.com/lightningnetwork/lnd/lnwire"
 	"github.com/lightningnetwork/lnd/macaroons"
@@ -234,6 +237,10 @@ var (
 			Entity: "onchain",
 			Action: "read",
 		}},
+		"/lnrpc.Lightning/EstimateFee": {{
+			Entity: "onchain",
+			Action: "read",
+		}},
 		"/lnrpc.Lightning/ChannelBalance": {{
 			Entity: "offchain",
 			Action: "read",
@@ -388,6 +395,10 @@ type rpcServer struct {
 	// connect to the main gRPC server to proxy all incoming requests.
 	tlsCfg *tls.Config
 
+	// routerBackend contains the backend implementation of the router
+	// rpc sub server.
+	routerBackend *routerrpc.RouterBackend
+
 	quit chan struct{}
 }
 
@@ -406,6 +417,28 @@ func newRPCServer(s *server, macService *macaroons.Service,
 	invoiceRegistry *invoices.InvoiceRegistry,
 	tlsCfg *tls.Config) (*rpcServer, error) {
 
+	// Set up router rpc backend.
+	channelGraph := s.chanDB.ChannelGraph()
+	selfNode, err := channelGraph.SourceNode()
+	if err != nil {
+		return nil, err
+	}
+	graph := s.chanDB.ChannelGraph()
+	routerBackend := &routerrpc.RouterBackend{
+		MaxPaymentMSat: maxPaymentMSat,
+		SelfNode:       selfNode.PubKeyBytes,
+		FetchChannelCapacity: func(chanID uint64) (btcutil.Amount,
+			error) {
+
+			info, _, _, err := graph.FetchChannelEdgesByID(chanID)
+			if err != nil {
+				return 0, err
+			}
+			return info.Capacity, nil
+		},
+		FindRoutes: s.chanRouter.FindRoutes,
+	}
+
 	var (
 		subServers     []lnrpc.SubServer
 		subServerPerms []lnrpc.MacaroonPerms
@@ -414,9 +447,10 @@ func newRPCServer(s *server, macService *macaroons.Service,
 	// Before we create any of the sub-servers, we need to ensure that all
 	// the dependencies they need are properly populated within each sub
 	// server configuration struct.
-	err := subServerCgs.PopulateDependencies(
+	err = subServerCgs.PopulateDependencies(
 		s.cc, networkDir, macService, atpl, invoiceRegistry,
-		activeNetParams.Params, s.chanRouter,
+		s.htlcSwitch, activeNetParams.Params, s.chanRouter,
+		routerBackend, s.nodeSigner, s.chanDB,
 	)
 	if err != nil {
 		return nil, err
@@ -480,6 +514,7 @@ func newRPCServer(s *server, macService *macaroons.Service,
 		tlsCfg:         tlsCfg,
 		grpcServer:     grpcServer,
 		server:         s,
+		routerBackend:  routerBackend,
 		quit:           make(chan struct{}, 1),
 	}
 	lnrpc.RegisterLightningServer(grpcServer, rootRPCServer)
@@ -770,6 +805,59 @@ func (r *rpcServer) ListUnspent(ctx context.Context,
 	return resp, nil
 }
 
+// EstimateFee handles a request for estimating the fee for sending a
+// transaction spending to multiple specified outputs in parallel.
+func (r *rpcServer) EstimateFee(ctx context.Context,
+	in *lnrpc.EstimateFeeRequest) (*lnrpc.EstimateFeeResponse, error) {
+
+	// Create the list of outputs we are spending to.
+	outputs, err := addrPairsToOutputs(in.AddrToAmount)
+	if err != nil {
+		return nil, err
+	}
+
+	// Query the fee estimator for the fee rate for the given confirmation
+	// target.
+	target := in.TargetConf
+	feePerKw, err := sweep.DetermineFeePerKw(
+		r.server.cc.feeEstimator, sweep.FeePreference{
+			ConfTarget: uint32(target),
+		},
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	// We will ask the wallet to create a tx using this fee rate. We set
+	// dryRun=true to avoid inflating the change addresses in the db.
+	var tx *txauthor.AuthoredTx
+	wallet := r.server.cc.wallet
+	err = wallet.WithCoinSelectLock(func() error {
+		tx, err = wallet.CreateSimpleTx(outputs, feePerKw, true)
+		return err
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	// Use the created tx to calculate the total fee.
+	totalOutput := int64(0)
+	for _, out := range tx.Tx.TxOut {
+		totalOutput += out.Value
+	}
+	totalFee := int64(tx.TotalInput) - totalOutput
+
+	resp := &lnrpc.EstimateFeeResponse{
+		FeeSat:            totalFee,
+		FeerateSatPerByte: int64(feePerKw.FeePerKVByte() / 1000),
+	}
+
+	rpcsLog.Debugf("[estimatefee] fee estimate for conf target %d: %v",
+		target, resp)
+
+	return resp, nil
+}
+
 // SendCoins executes a request to send coins to a particular address. Unlike
 // SendMany, this RPC call only allows creating a single output at a time.
 func (r *rpcServer) SendCoins(ctx context.Context,
@@ -932,17 +1020,42 @@ func (r *rpcServer) NewAddress(ctx context.Context,
 
 	// Translate the gRPC proto address type to the wallet controller's
 	// available address types.
-	var addrType lnwallet.AddressType
+	var (
+		addr btcutil.Address
+		err  error
+	)
 	switch in.Type {
 	case lnrpc.AddressType_WITNESS_PUBKEY_HASH:
-		addrType = lnwallet.WitnessPubKey
-	case lnrpc.AddressType_NESTED_PUBKEY_HASH:
-		addrType = lnwallet.NestedWitnessPubKey
-	}
+		addr, err = r.server.cc.wallet.NewAddress(
+			lnwallet.WitnessPubKey, false,
+		)
+		if err != nil {
+			return nil, err
+		}
 
-	addr, err := r.server.cc.wallet.NewAddress(addrType, false)
-	if err != nil {
-		return nil, err
+	case lnrpc.AddressType_NESTED_PUBKEY_HASH:
+		addr, err = r.server.cc.wallet.NewAddress(
+			lnwallet.NestedWitnessPubKey, false,
+		)
+		if err != nil {
+			return nil, err
+		}
+
+	case lnrpc.AddressType_UNUSED_WITNESS_PUBKEY_HASH:
+		addr, err = r.server.cc.wallet.LastUnusedAddress(
+			lnwallet.WitnessPubKey,
+		)
+		if err != nil {
+			return nil, err
+		}
+
+	case lnrpc.AddressType_UNUSED_NESTED_PUBKEY_HASH:
+		addr, err = r.server.cc.wallet.LastUnusedAddress(
+			lnwallet.NestedWitnessPubKey,
+		)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	rpcsLog.Infof("[newaddress] addr=%v", addr.String())
@@ -1779,16 +1892,21 @@ func (r *rpcServer) fetchActiveChannel(chanPoint wire.OutPoint) (
 func (r *rpcServer) GetInfo(ctx context.Context,
 	in *lnrpc.GetInfoRequest) (*lnrpc.GetInfoResponse, error) {
 
-	var activeChannels uint32
 	serverPeers := r.server.Peers()
-	for _, serverPeer := range serverPeers {
-		activeChannels += uint32(len(serverPeer.ChannelSnapshots()))
-	}
 
 	openChannels, err := r.server.chanDB.FetchAllOpenChannels()
 	if err != nil {
 		return nil, err
 	}
+
+	var activeChannels uint32
+	for _, channel := range openChannels {
+		chanID := lnwire.NewChanIDFromOutPoint(&channel.FundingOutpoint)
+		if r.server.htlcSwitch.HasActiveLink(chanID) {
+			activeChannels++
+		}
+	}
+
 	inactiveChannels := uint32(len(openChannels)) - activeChannels
 
 	pendingChannels, err := r.server.chanDB.FetchPendingChannels()
@@ -2317,7 +2435,7 @@ func (r *rpcServer) ListChannels(ctx context.Context,
 		return nil, err
 	}
 
-	rpcsLog.Infof("[listchannels] fetched %v channels from DB",
+	rpcsLog.Debugf("[listchannels] fetched %v channels from DB",
 		len(dbChannels))
 
 	for _, dbChannel := range dbChannels {
@@ -2370,11 +2488,6 @@ func createRPCOpenChannel(r *rpcServer, graph *channeldb.ChannelGraph,
 	nodeID := hex.EncodeToString(nodePub.SerializeCompressed())
 	chanPoint := dbChannel.FundingOutpoint
 
-	// With the channel point known, retrieve the network channel
-	// ID from the database.
-	var chanID uint64
-	chanID, _ = graph.ChannelID(&chanPoint)
-
 	// Next, we'll determine whether the channel is public or not.
 	isPublic := dbChannel.ChannelFlags&lnwire.FFAnnounceChannel != 0
 
@@ -2409,7 +2522,7 @@ func createRPCOpenChannel(r *rpcServer, graph *channeldb.ChannelGraph,
 		Private:               !isPublic,
 		RemotePubkey:          nodeID,
 		ChannelPoint:          chanPoint.String(),
-		ChanId:                chanID,
+		ChanId:                dbChannel.ShortChannelID.ToUint64(),
 		Capacity:              int64(dbChannel.Capacity),
 		LocalBalance:          int64(localBalance.ToSatoshis()),
 		RemoteBalance:         int64(remoteBalance.ToSatoshis()),
@@ -2734,10 +2847,11 @@ func unmarshallSendToRouteRequest(req *lnrpc.SendToRouteRequest,
 type rpcPaymentIntent struct {
 	msat              lnwire.MilliSatoshi
 	feeLimit          lnwire.MilliSatoshi
-	dest              *btcec.PublicKey
+	cltvLimit         *uint32
+	dest              routing.Vertex
 	rHash             [32]byte
 	cltvDelta         uint16
-	routeHints        [][]routing.HopHint
+	routeHints        [][]zpay32.HopHint
 	outgoingChannelID *uint64
 
 	routes []*routing.Route
@@ -2748,7 +2862,6 @@ type rpcPaymentIntent struct {
 // three ways a client can specify their payment details: a payment request,
 // via manual details, or via a complete route.
 func extractPaymentIntent(rpcPayReq *rpcPaymentRequest) (rpcPaymentIntent, error) {
-	var err error
 	payIntent := rpcPaymentIntent{}
 
 	// If a route was specified, then we can use that directly.
@@ -2776,6 +2889,11 @@ func extractPaymentIntent(rpcPayReq *rpcPaymentRequest) (rpcPaymentIntent, error
 	// restriction if specified.
 	if rpcPayReq.OutgoingChanId != 0 {
 		payIntent.outgoingChannelID = &rpcPayReq.OutgoingChanId
+	}
+
+	// Take cltv limit from request if set.
+	if rpcPayReq.CltvLimit != 0 {
+		payIntent.cltvLimit = &rpcPayReq.CltvLimit
 	}
 
 	// If the payment request field isn't blank, then the details of the
@@ -2819,7 +2937,8 @@ func extractPaymentIntent(rpcPayReq *rpcPaymentRequest) (rpcPaymentIntent, error
 		)
 
 		copy(payIntent.rHash[:], payReq.PaymentHash[:])
-		payIntent.dest = payReq.Destination
+		destKey := payReq.Destination.SerializeCompressed()
+		copy(payIntent.dest[:], destKey)
 		payIntent.cltvDelta = uint16(payReq.MinFinalCLTVExpiry())
 		payIntent.routeHints = payReq.RouteHints
 
@@ -2829,24 +2948,20 @@ func extractPaymentIntent(rpcPayReq *rpcPaymentRequest) (rpcPaymentIntent, error
 	// At this point, a destination MUST be specified, so we'll convert it
 	// into the proper representation now. The destination will either be
 	// encoded as raw bytes, or via a hex string.
+	var pubBytes []byte
 	if len(rpcPayReq.Dest) != 0 {
-		payIntent.dest, err = btcec.ParsePubKey(
-			rpcPayReq.Dest, btcec.S256(),
-		)
-		if err != nil {
-			return payIntent, err
-		}
-
+		pubBytes = rpcPayReq.Dest
 	} else {
-		pubBytes, err := hex.DecodeString(rpcPayReq.DestString)
-		if err != nil {
-			return payIntent, err
-		}
-		payIntent.dest, err = btcec.ParsePubKey(pubBytes, btcec.S256())
+		var err error
+		pubBytes, err = hex.DecodeString(rpcPayReq.DestString)
 		if err != nil {
 			return payIntent, err
 		}
 	}
+	if len(pubBytes) != 33 {
+		return payIntent, errors.New("invalid key length")
+	}
+	copy(payIntent.dest[:], pubBytes)
 
 	// Otherwise, If the payment request field was not specified
 	// (and a custom route wasn't specified), construct the payment
@@ -2930,6 +3045,7 @@ func (r *rpcServer) dispatchPaymentIntent(
 			Target:            payIntent.dest,
 			Amount:            payIntent.msat,
 			FeeLimit:          payIntent.feeLimit,
+			CltvLimit:         payIntent.cltvLimit,
 			PaymentHash:       payIntent.rHash,
 			RouteHints:        payIntent.routeHints,
 			OutgoingChannelID: payIntent.outgoingChannelID,
@@ -3127,7 +3243,9 @@ func (r *rpcServer) sendPayment(stream *paymentStream) error {
 					return
 				}
 
-				marshalledRouted := r.marshallRoute(resp.Route)
+				marshalledRouted := r.routerBackend.
+					MarshallRoute(resp.Route)
+
 				err := stream.send(&lnrpc.SendResponse{
 					PaymentHash:     payIntent.rHash[:],
 					PaymentPreimage: resp.Preimage[:],
@@ -3212,7 +3330,7 @@ func (r *rpcServer) sendPaymentSync(ctx context.Context,
 	return &lnrpc.SendResponse{
 		PaymentHash:     payIntent.rHash[:],
 		PaymentPreimage: resp.Preimage[:],
-		PaymentRoute:    r.marshallRoute(resp.Route),
+		PaymentRoute:    r.routerBackend.MarshallRoute(resp.Route),
 	}, nil
 }
 
@@ -3222,309 +3340,51 @@ func (r *rpcServer) sendPaymentSync(ctx context.Context,
 func (r *rpcServer) AddInvoice(ctx context.Context,
 	invoice *lnrpc.Invoice) (*lnrpc.AddInvoiceResponse, error) {
 
-	var paymentPreimage [32]byte
+	defaultDelta := cfg.Bitcoin.TimeLockDelta
+	if registeredChains.PrimaryChain() == litecoinChain {
+		defaultDelta = cfg.Litecoin.TimeLockDelta
+	}
 
-	switch {
-	// If a preimage wasn't specified, then we'll generate a new preimage
-	// from fresh cryptographic randomness.
-	case len(invoice.RPreimage) == 0:
-		if _, err := rand.Read(paymentPreimage[:]); err != nil {
+	addInvoiceCfg := &invoicesrpc.AddInvoiceConfig{
+		AddInvoice:        r.server.invoices.AddInvoice,
+		IsChannelActive:   r.server.htlcSwitch.HasActiveLink,
+		ChainParams:       activeNetParams.Params,
+		NodeSigner:        r.server.nodeSigner,
+		MaxPaymentMSat:    maxPaymentMSat,
+		DefaultCLTVExpiry: defaultDelta,
+		ChanDB:            r.server.chanDB,
+	}
+
+	addInvoiceData := &invoicesrpc.AddInvoiceData{
+		Memo:            invoice.Memo,
+		Receipt:         invoice.Receipt,
+		Value:           btcutil.Amount(invoice.Value),
+		DescriptionHash: invoice.DescriptionHash,
+		Expiry:          invoice.Expiry,
+		FallbackAddr:    invoice.FallbackAddr,
+		CltvExpiry:      invoice.CltvExpiry,
+		Private:         invoice.Private,
+	}
+
+	if invoice.RPreimage != nil {
+		preimage, err := lntypes.MakePreimage(invoice.RPreimage)
+		if err != nil {
 			return nil, err
 		}
-
-	// Otherwise, if a preimage was specified, then it MUST be exactly
-	// 32-bytes.
-	case len(invoice.RPreimage) > 0 && len(invoice.RPreimage) != 32:
-		return nil, fmt.Errorf("payment preimage must be exactly "+
-			"32 bytes, is instead %v", len(invoice.RPreimage))
-
-	// If the preimage meets the size specifications, then it can be used
-	// as is.
-	default:
-		copy(paymentPreimage[:], invoice.RPreimage[:])
+		addInvoiceData.Preimage = &preimage
 	}
 
-	// The size of the memo, receipt and description hash attached must not
-	// exceed the maximum values for either of the fields.
-	if len(invoice.Memo) > channeldb.MaxMemoSize {
-		return nil, fmt.Errorf("memo too large: %v bytes "+
-			"(maxsize=%v)", len(invoice.Memo), channeldb.MaxMemoSize)
-	}
-	if len(invoice.Receipt) > channeldb.MaxReceiptSize {
-		return nil, fmt.Errorf("receipt too large: %v bytes "+
-			"(maxsize=%v)", len(invoice.Receipt), channeldb.MaxReceiptSize)
-	}
-	if len(invoice.DescriptionHash) > 0 && len(invoice.DescriptionHash) != 32 {
-		return nil, fmt.Errorf("description hash is %v bytes, must be %v",
-			len(invoice.DescriptionHash), channeldb.MaxPaymentRequestSize)
-	}
-
-	// The value of the invoice must not be negative.
-	if invoice.Value < 0 {
-		return nil, fmt.Errorf("payments of negative value "+
-			"are not allowed, value is %v", invoice.Value)
-	}
-
-	amt := btcutil.Amount(invoice.Value)
-	amtMSat := lnwire.NewMSatFromSatoshis(amt)
-
-	// The value of the invoice must also not exceed the current soft-limit
-	// on the largest payment within the network.
-	if amtMSat > maxPaymentMSat {
-		return nil, fmt.Errorf("payment of %v is too large, max "+
-			"payment allowed is %v", amt, maxPaymentMSat.ToSatoshis())
-	}
-
-	// Next, generate the payment hash itself from the preimage. This will
-	// be used by clients to query for the state of a particular invoice.
-	rHash := sha256.Sum256(paymentPreimage[:])
-
-	// We also create an encoded payment request which allows the
-	// caller to compactly send the invoice to the payer. We'll create a
-	// list of options to be added to the encoded payment request. For now
-	// we only support the required fields description/description_hash,
-	// expiry, fallback address, and the amount field.
-	var options []func(*zpay32.Invoice)
-
-	// We only include the amount in the invoice if it is greater than 0.
-	// By not including the amount, we enable the creation of invoices that
-	// allow the payee to specify the amount of satoshis they wish to send.
-	if amtMSat > 0 {
-		options = append(options, zpay32.Amount(amtMSat))
-	}
-
-	// If specified, add a fallback address to the payment request.
-	if len(invoice.FallbackAddr) > 0 {
-		addr, err := btcutil.DecodeAddress(invoice.FallbackAddr,
-			activeNetParams.Params)
-		if err != nil {
-			return nil, fmt.Errorf("invalid fallback address: %v",
-				err)
-		}
-		options = append(options, zpay32.FallbackAddr(addr))
-	}
-
-	// If expiry is set, specify it. If it is not provided, no expiry time
-	// will be explicitly added to this payment request, which will imply
-	// the default 3600 seconds.
-	if invoice.Expiry > 0 {
-
-		// We'll ensure that the specified expiry is restricted to sane
-		// number of seconds. As a result, we'll reject an invoice with
-		// an expiry greater than 1 year.
-		maxExpiry := time.Hour * 24 * 365
-		expSeconds := invoice.Expiry
-
-		if float64(expSeconds) > maxExpiry.Seconds() {
-			return nil, fmt.Errorf("expiry of %v seconds "+
-				"greater than max expiry of %v seconds",
-				float64(expSeconds), maxExpiry.Seconds())
-		}
-
-		expiry := time.Duration(invoice.Expiry) * time.Second
-		options = append(options, zpay32.Expiry(expiry))
-	}
-
-	// If the description hash is set, then we add it do the list of options.
-	// If not, use the memo field as the payment request description.
-	if len(invoice.DescriptionHash) > 0 {
-		var descHash [32]byte
-		copy(descHash[:], invoice.DescriptionHash[:])
-		options = append(options, zpay32.DescriptionHash(descHash))
-	} else {
-		// Use the memo field as the description. If this is not set
-		// this will just be an empty string.
-		options = append(options, zpay32.Description(invoice.Memo))
-	}
-
-	// We'll use our current default CLTV value unless one was specified as
-	// an option on the command line when creating an invoice.
-	switch {
-	case invoice.CltvExpiry > math.MaxUint16:
-		return nil, fmt.Errorf("CLTV delta of %v is too large, max "+
-			"accepted is: %v", invoice.CltvExpiry, math.MaxUint16)
-	case invoice.CltvExpiry != 0:
-		options = append(options,
-			zpay32.CLTVExpiry(invoice.CltvExpiry))
-	default:
-		// TODO(roasbeef): assumes set delta between versions
-		defaultDelta := cfg.Bitcoin.TimeLockDelta
-		if registeredChains.PrimaryChain() == litecoinChain {
-			defaultDelta = cfg.Litecoin.TimeLockDelta
-		}
-		options = append(options, zpay32.CLTVExpiry(uint64(defaultDelta)))
-	}
-
-	// If we were requested to include routing hints in the invoice, then
-	// we'll fetch all of our available private channels and create routing
-	// hints for them.
-	if invoice.Private {
-		openChannels, err := r.server.chanDB.FetchAllChannels()
-		if err != nil {
-			return nil, fmt.Errorf("could not fetch all channels")
-		}
-
-		graph := r.server.chanDB.ChannelGraph()
-
-		numHints := 0
-		for _, channel := range openChannels {
-			// We'll restrict the number of individual route hints
-			// to 20 to avoid creating overly large invoices.
-			if numHints > 20 {
-				break
-			}
-
-			// Since we're only interested in our private channels,
-			// we'll skip public ones.
-			isPublic := channel.ChannelFlags&lnwire.FFAnnounceChannel != 0
-			if isPublic {
-				continue
-			}
-
-			// Make sure the counterparty has enough balance in the
-			// channel for our amount. We do this in order to reduce
-			// payment errors when attempting to use this channel
-			// as a hint.
-			chanPoint := lnwire.NewChanIDFromOutPoint(
-				&channel.FundingOutpoint,
-			)
-			if amtMSat >= channel.LocalCommitment.RemoteBalance {
-				rpcsLog.Debugf("Skipping channel %v due to "+
-					"not having enough remote balance",
-					chanPoint)
-				continue
-			}
-
-			// Make sure the channel is active.
-			link, err := r.server.htlcSwitch.GetLink(chanPoint)
-			if err != nil {
-				rpcsLog.Errorf("Unable to get link for "+
-					"channel %v: %v", chanPoint, err)
-				continue
-			}
-
-			if !link.EligibleToForward() {
-				rpcsLog.Debugf("Skipping channel %v due to not "+
-					"being eligible to forward payments",
-					chanPoint)
-				continue
-			}
-
-			// To ensure we don't leak unadvertised nodes, we'll
-			// make sure our counterparty is publicly advertised
-			// within the network. Otherwise, we'll end up leaking
-			// information about nodes that intend to stay
-			// unadvertised, like in the case of a node only having
-			// private channels.
-			var remotePub [33]byte
-			copy(remotePub[:], channel.IdentityPub.SerializeCompressed())
-			isRemoteNodePublic, err := graph.IsPublicNode(remotePub)
-			if err != nil {
-				rpcsLog.Errorf("Unable to determine if node %x "+
-					"is advertised: %v", remotePub, err)
-				continue
-			}
-
-			if !isRemoteNodePublic {
-				rpcsLog.Debugf("Skipping channel %v due to "+
-					"counterparty %x being unadvertised",
-					chanPoint, remotePub)
-				continue
-			}
-
-			// Fetch the policies for each end of the channel.
-			chanID := channel.ShortChanID().ToUint64()
-			info, p1, p2, err := graph.FetchChannelEdgesByID(chanID)
-			if err != nil {
-				rpcsLog.Errorf("Unable to fetch the routing "+
-					"policies for the edges of the channel "+
-					"%v: %v", chanPoint, err)
-				continue
-			}
-
-			// Now, we'll need to determine which is the correct
-			// policy for HTLCs being sent from the remote node.
-			var remotePolicy *channeldb.ChannelEdgePolicy
-			if bytes.Equal(remotePub[:], info.NodeKey1Bytes[:]) {
-				remotePolicy = p1
-			} else {
-				remotePolicy = p2
-			}
-
-			// If for some reason we don't yet have the edge for
-			// the remote party, then we'll just skip adding this
-			// channel as a routing hint.
-			if remotePolicy == nil {
-				continue
-			}
-
-			// Finally, create the routing hint for this channel and
-			// add it to our list of route hints.
-			hint := routing.HopHint{
-				NodeID:      channel.IdentityPub,
-				ChannelID:   chanID,
-				FeeBaseMSat: uint32(remotePolicy.FeeBaseMSat),
-				FeeProportionalMillionths: uint32(
-					remotePolicy.FeeProportionalMillionths,
-				),
-				CLTVExpiryDelta: remotePolicy.TimeLockDelta,
-			}
-
-			// Include the route hint in our set of options that
-			// will be used when creating the invoice.
-			routeHint := []routing.HopHint{hint}
-			options = append(options, zpay32.RouteHint(routeHint))
-
-			numHints++
-		}
-
-	}
-
-	// Create and encode the payment request as a bech32 (zpay32) string.
-	creationDate := time.Now()
-	payReq, err := zpay32.NewInvoice(
-		activeNetParams.Params, rHash, creationDate, options...,
+	hash, dbInvoice, err := invoicesrpc.AddInvoice(
+		ctx, addInvoiceCfg, addInvoiceData,
 	)
-	if err != nil {
-		return nil, err
-	}
-
-	payReqString, err := payReq.Encode(
-		zpay32.MessageSigner{
-			SignCompact: r.server.nodeSigner.SignDigestCompact,
-		},
-	)
-	if err != nil {
-		return nil, err
-	}
-
-	newInvoice := &channeldb.Invoice{
-		CreationDate:   creationDate,
-		Memo:           []byte(invoice.Memo),
-		Receipt:        invoice.Receipt,
-		PaymentRequest: []byte(payReqString),
-		Terms: channeldb.ContractTerm{
-			Value: amtMSat,
-		},
-	}
-	copy(newInvoice.Terms.PaymentPreimage[:], paymentPreimage[:])
-
-	rpcsLog.Tracef("[addinvoice] adding new invoice %v",
-		newLogClosure(func() string {
-			return spew.Sdump(newInvoice)
-		}),
-	)
-
-	// With all sanity checks passed, write the invoice to the database.
-	addIndex, err := r.server.invoices.AddInvoice(newInvoice, rHash)
 	if err != nil {
 		return nil, err
 	}
 
 	return &lnrpc.AddInvoiceResponse{
-		RHash:          rHash[:],
-		PaymentRequest: payReqString,
-		AddIndex:       addIndex,
+		AddIndex:       dbInvoice.AddIndex,
+		PaymentRequest: string(dbInvoice.PaymentRequest),
+		RHash:          hash[:],
 	}, nil
 }
 
@@ -3850,6 +3710,7 @@ func marshalDbEdge(edgeInfo *channeldb.ChannelEdgeInfo,
 		edge.Node1Policy = &lnrpc.RoutingPolicy{
 			TimeLockDelta:    uint32(c1.TimeLockDelta),
 			MinHtlc:          int64(c1.MinHTLC),
+			MaxHtlcMsat:      uint64(c1.MaxHTLC),
 			FeeBaseMsat:      int64(c1.FeeBaseMSat),
 			FeeRateMilliMsat: int64(c1.FeeProportionalMillionths),
 			Disabled:         c1.ChannelFlags&lnwire.ChanUpdateDisabled != 0,
@@ -3860,6 +3721,7 @@ func marshalDbEdge(edgeInfo *channeldb.ChannelEdgeInfo,
 		edge.Node2Policy = &lnrpc.RoutingPolicy{
 			TimeLockDelta:    uint32(c2.TimeLockDelta),
 			MinHtlc:          int64(c2.MinHTLC),
+			MaxHtlcMsat:      uint64(c2.MaxHTLC),
 			FeeBaseMsat:      int64(c2.FeeBaseMSat),
 			FeeRateMilliMsat: int64(c2.FeeProportionalMillionths),
 			Disabled:         c2.ChannelFlags&lnwire.ChanUpdateDisabled != 0,
@@ -3969,121 +3831,7 @@ func (r *rpcServer) GetNodeInfo(ctx context.Context,
 func (r *rpcServer) QueryRoutes(ctx context.Context,
 	in *lnrpc.QueryRoutesRequest) (*lnrpc.QueryRoutesResponse, error) {
 
-	// First parse the hex-encoded public key into a full public key object
-	// we can properly manipulate.
-	pubKeyBytes, err := hex.DecodeString(in.PubKey)
-	if err != nil {
-		return nil, err
-	}
-	pubKey, err := btcec.ParsePubKey(pubKeyBytes, btcec.S256())
-	if err != nil {
-		return nil, err
-	}
-
-	// Currently, within the bootstrap phase of the network, we limit the
-	// largest payment size allotted to (2^32) - 1 mSAT or 4.29 million
-	// satoshis.
-	amt := btcutil.Amount(in.Amt)
-	amtMSat := lnwire.NewMSatFromSatoshis(amt)
-	if amtMSat > maxPaymentMSat {
-		return nil, fmt.Errorf("payment of %v is too large, max payment "+
-			"allowed is %v", amt, maxPaymentMSat.ToSatoshis())
-	}
-
-	feeLimit := calculateFeeLimit(in.FeeLimit, amtMSat)
-
-	// numRoutes will default to 10 if not specified explicitly.
-	numRoutesIn := uint32(in.NumRoutes)
-	if numRoutesIn == 0 {
-		numRoutesIn = 10
-	}
-
-	// Query the channel router for a possible path to the destination that
-	// can carry `in.Amt` satoshis _including_ the total fee required on
-	// the route.
-	var (
-		routes  []*routing.Route
-		findErr error
-	)
-	if in.FinalCltvDelta == 0 {
-		routes, findErr = r.server.chanRouter.FindRoutes(
-			pubKey, amtMSat, feeLimit, numRoutesIn,
-		)
-	} else {
-		routes, findErr = r.server.chanRouter.FindRoutes(
-			pubKey, amtMSat, feeLimit, numRoutesIn,
-			uint16(in.FinalCltvDelta),
-		)
-	}
-	if findErr != nil {
-		return nil, findErr
-	}
-
-	// As the number of returned routes can be less than the number of
-	// requested routes, we'll clamp down the length of the response to the
-	// minimum of the two.
-	numRoutes := uint32(len(routes))
-	if numRoutesIn < numRoutes {
-		numRoutes = numRoutesIn
-	}
-
-	// For each valid route, we'll convert the result into the format
-	// required by the RPC system.
-	routeResp := &lnrpc.QueryRoutesResponse{
-		Routes: make([]*lnrpc.Route, 0, in.NumRoutes),
-	}
-	for i := uint32(0); i < numRoutes; i++ {
-		routeResp.Routes = append(
-			routeResp.Routes, r.marshallRoute(routes[i]),
-		)
-	}
-
-	return routeResp, nil
-}
-
-func (r *rpcServer) marshallRoute(route *routing.Route) *lnrpc.Route {
-	resp := &lnrpc.Route{
-		TotalTimeLock: route.TotalTimeLock,
-		TotalFees:     int64(route.TotalFees.ToSatoshis()),
-		TotalFeesMsat: int64(route.TotalFees),
-		TotalAmt:      int64(route.TotalAmount.ToSatoshis()),
-		TotalAmtMsat:  int64(route.TotalAmount),
-		Hops:          make([]*lnrpc.Hop, len(route.Hops)),
-	}
-	graph := r.server.chanDB.ChannelGraph()
-	incomingAmt := route.TotalAmount
-	for i, hop := range route.Hops {
-		fee := route.HopFee(i)
-
-		// Channel capacity is not a defining property of a route. For
-		// backwards RPC compatibility, we retrieve it here from the
-		// graph.
-		var chanCapacity btcutil.Amount
-		info, _, _, err := graph.FetchChannelEdgesByID(hop.ChannelID)
-		if err == nil {
-			chanCapacity = info.Capacity
-		} else {
-			// If capacity cannot be retrieved, this may be a
-			// not-yet-received or private channel. Then report
-			// amount that is sent through the channel as capacity.
-			chanCapacity = incomingAmt.ToSatoshis()
-		}
-
-		resp.Hops[i] = &lnrpc.Hop{
-			ChanId:           hop.ChannelID,
-			ChanCapacity:     int64(chanCapacity),
-			AmtToForward:     int64(hop.AmtToForward.ToSatoshis()),
-			AmtToForwardMsat: int64(hop.AmtToForward),
-			Fee:              int64(fee.ToSatoshis()),
-			FeeMsat:          int64(fee),
-			Expiry:           uint32(hop.OutgoingTimeLock),
-			PubKey: hex.EncodeToString(
-				hop.PubKeyBytes[:]),
-		}
-		incomingAmt = hop.AmtToForward
-	}
-
-	return resp
+	return r.routerBackend.QueryRoutes(ctx, in)
 }
 
 // unmarshallHopByChannelLookup unmarshalls an rpc hop for which the pub key is
@@ -4206,12 +3954,17 @@ func (r *rpcServer) GetNetworkInfo(ctx context.Context,
 		totalNetworkCapacity btcutil.Amount
 		minChannelSize       btcutil.Amount = math.MaxInt64
 		maxChannelSize       btcutil.Amount
+		medianChanSize       btcutil.Amount
 	)
 
 	// We'll use this map to de-duplicate channels during our traversal.
 	// This is needed since channels are directional, so there will be two
 	// edges for each channel within the graph.
 	seenChans := make(map[uint64]struct{})
+
+	// We also keep a list of all encountered capacities, in order to
+	// calculate the median channel size.
+	var allChans []btcutil.Amount
 
 	// We'll run through all the known nodes in the within our view of the
 	// network, tallying up the total number of nodes, and also gathering
@@ -4259,6 +4012,7 @@ func (r *rpcServer) GetNetworkInfo(ctx context.Context,
 			numChannels++
 
 			seenChans[edge.ChannelID] = struct{}{}
+			allChans = append(allChans, edge.Capacity)
 			return nil
 		}); err != nil {
 			return err
@@ -4275,6 +4029,9 @@ func (r *rpcServer) GetNetworkInfo(ctx context.Context,
 		return nil, err
 	}
 
+	// Find the median.
+	medianChanSize = autopilot.Median(allChans)
+
 	// If we don't have any channels, then reset the minChannelSize to zero
 	// to avoid outputting NaN in encoded JSON.
 	if numChannels == 0 {
@@ -4284,17 +4041,17 @@ func (r *rpcServer) GetNetworkInfo(ctx context.Context,
 	// TODO(roasbeef): graph diameter
 
 	// TODO(roasbeef): also add oldest channel?
-	//  * also add median channel size
 	netInfo := &lnrpc.NetworkInfo{
 		MaxOutDegree:         maxChanOut,
-		AvgOutDegree:         float64(numChannels) / float64(numNodes),
+		AvgOutDegree:         float64(2*numChannels) / float64(numNodes),
 		NumNodes:             numNodes,
 		NumChannels:          numChannels,
 		TotalNetworkCapacity: int64(totalNetworkCapacity),
 		AvgChannelSize:       float64(totalNetworkCapacity) / float64(numChannels),
 
-		MinChannelSize: int64(minChannelSize),
-		MaxChannelSize: int64(maxChannelSize),
+		MinChannelSize:       int64(minChannelSize),
+		MaxChannelSize:       int64(maxChannelSize),
+		MedianChannelSizeSat: int64(medianChanSize),
 	}
 
 	// Similarly, if we don't have any channels, then we'll also set the
@@ -4408,6 +4165,7 @@ func marshallTopologyChange(topChange *routing.TopologyChange) *lnrpc.GraphTopol
 			RoutingPolicy: &lnrpc.RoutingPolicy{
 				TimeLockDelta:    uint32(channelUpdate.TimeLockDelta),
 				MinHtlc:          int64(channelUpdate.MinHTLC),
+				MaxHtlcMsat:      uint64(channelUpdate.MaxHTLC),
 				FeeBaseMsat:      int64(channelUpdate.BaseFee),
 				FeeRateMilliMsat: int64(channelUpdate.FeeRate),
 				Disabled:         channelUpdate.Disabled,
@@ -4674,7 +4432,7 @@ func (r *rpcServer) FeeReport(ctx context.Context,
 	// Before we perform the queries below, we'll instruct the switch to
 	// flush any pending events to disk. This ensure we get a complete
 	// snapshot at this particular time.
-	if r.server.htlcSwitch.FlushForwardingEvents(); err != nil {
+	if err := r.server.htlcSwitch.FlushForwardingEvents(); err != nil {
 		return nil, fmt.Errorf("unable to flush forwarding "+
 			"events: %v", err)
 	}

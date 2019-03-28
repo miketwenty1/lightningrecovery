@@ -564,7 +564,7 @@
           },
           {
             "name": "num_routes",
-            "description": "/ The max number of routes to return.",
+            "description": "*\nDeprecated. The max number of routes to return. In the future, QueryRoutes\nwill only return a single route.",
             "in": "query",
             "required": false,
             "type": "integer",
@@ -593,6 +593,24 @@
             "required": false,
             "type": "string",
             "format": "int64"
+          },
+          {
+            "name": "ignored_nodes",
+            "description": "*\nA list of nodes to ignore during path finding.",
+            "in": "query",
+            "required": false,
+            "type": "array",
+            "items": {
+              "type": "string",
+              "format": "byte"
+            }
+          },
+          {
+            "name": "source_pub_key",
+            "description": "*\nThe source node where the request route should originated from. If empty,\nself is assumed.",
+            "in": "query",
+            "required": false,
+            "type": "string"
           }
         ],
         "tags": [
@@ -793,7 +811,9 @@
             "type": "string",
             "enum": [
               "WITNESS_PUBKEY_HASH",
-              "NESTED_PUBKEY_HASH"
+              "NESTED_PUBKEY_HASH",
+              "UNUSED_WITNESS_PUBKEY_HASH",
+              "UNUSED_NESTED_PUBKEY_HASH"
             ],
             "default": "WITNESS_PUBKEY_HASH"
           }
@@ -1024,6 +1044,33 @@
         ]
       }
     },
+    "/v1/transactions/fee": {
+      "get": {
+        "summary": "* lncli: `estimatefee`\nEstimateFee asks the chain backend to estimate the fee rate and total fees\nfor a transaction that pays to multiple specified outputs.",
+        "operationId": "EstimateFee",
+        "responses": {
+          "200": {
+            "description": "",
+            "schema": {
+              "$ref": "#/definitions/lnrpcEstimateFeeResponse"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "target_conf",
+            "description": "/ The target number of blocks that this transaction should be confirmed by.",
+            "in": "query",
+            "required": false,
+            "type": "integer",
+            "format": "int32"
+          }
+        ],
+        "tags": [
+          "Lightning"
+        ]
+      }
+    },
     "/v1/unlockwallet": {
       "post": {
         "summary": "* lncli: `unlock`\nUnlockWallet is used at startup of lnd to provide a password to unlock\nthe wallet database.",
@@ -1142,7 +1189,8 @@
       "enum": [
         "OPEN",
         "SETTLED",
-        "CANCELED"
+        "CANCELED",
+        "ACCEPTED"
       ],
       "default": "OPEN"
     },
@@ -1289,7 +1337,9 @@
       "type": "string",
       "enum": [
         "WITNESS_PUBKEY_HASH",
-        "NESTED_PUBKEY_HASH"
+        "NESTED_PUBKEY_HASH",
+        "UNUSED_WITNESS_PUBKEY_HASH",
+        "UNUSED_NESTED_PUBKEY_HASH"
       ],
       "default": "WITNESS_PUBKEY_HASH",
       "description": "- `p2wkh`: Pay to witness key hash (`WITNESS_PUBKEY_HASH` = 0)\n- `np2wkh`: Pay to nested witness key hash (`NESTED_PUBKEY_HASH` = 1)",
@@ -1723,6 +1773,21 @@
     },
     "lnrpcDisconnectPeerResponse": {
       "type": "object"
+    },
+    "lnrpcEstimateFeeResponse": {
+      "type": "object",
+      "properties": {
+        "fee_sat": {
+          "type": "string",
+          "format": "int64",
+          "description": "/ The total fee in satoshis."
+        },
+        "feerate_sat_per_byte": {
+          "type": "string",
+          "format": "int64",
+          "description": "/ The fee rate in satoshi/byte."
+        }
+      }
     },
     "lnrpcFeeLimit": {
       "type": "object",
@@ -2335,6 +2400,10 @@
         "max_channel_size": {
           "type": "string",
           "format": "int64"
+        },
+        "median_channel_size_sat": {
+          "type": "string",
+          "format": "int64"
         }
       }
     },
@@ -2815,6 +2884,10 @@
         "disabled": {
           "type": "boolean",
           "format": "boolean"
+        },
+        "max_htlc_msat": {
+          "type": "string",
+          "format": "uint64"
         }
       }
     },
@@ -2908,6 +2981,11 @@
           "type": "string",
           "format": "uint64",
           "description": "*\nThe channel id of the channel that must be taken to the first hop. If zero,\nany channel may be used."
+        },
+        "cltv_limit": {
+          "type": "integer",
+          "format": "int64",
+          "description": "* \nAn optional maximum total time lock for the route. If zero, there is no\nmaximum enforced."
         }
       }
     },
