@@ -239,7 +239,7 @@ type statusRequest struct {
 // disableRequests channels.
 func (m *ChanStatusManager) submitRequest(reqChan chan statusRequest,
 	outpoint wire.OutPoint) error {
-
+        return nil
 	req := statusRequest{
 		outpoint: outpoint,
 		errChan:  make(chan error, 1),

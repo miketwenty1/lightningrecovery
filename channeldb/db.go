@@ -360,7 +360,7 @@ func (d *DB) fetchOpenChannels(tx *bbolt.Tx,
 
 		// Finally, we both of the necessary buckets retrieved, fetch
 		// all the active channels related to this node.
-		nodeChannels, err := d.fetchNodeChannels(chainBucket)
+		nodeChannels, err := d.fetchNodeChannels(tx, chainBucket)
 		if err != nil {
 			return fmt.Errorf("unable to read channel for "+
 				"chain_hash=%x, node_key=%x: %v",
@@ -377,7 +377,15 @@ func (d *DB) fetchOpenChannels(tx *bbolt.Tx,
 // fetchNodeChannels retrieves all active channels from the target chainBucket
 // which is under a node's dedicated channel bucket. This function is typically
 // used to fetch all the active channels related to a particular node.
-func (d *DB) fetchNodeChannels(chainBucket *bbolt.Bucket) ([]*OpenChannel, error) {
+func (d *DB) fetchNodeChannels(tx *bbolt.Tx, chainBucket *bbolt.Bucket) ([]*OpenChannel, error) {
+
+        defer func() {
+                if r := recover(); r != nil {
+                        log.Errorf("recovered: %v", r)
+                }
+        }()
+
+	bcBkt := tx.Bucket(borkedChannelBucket)
 
 	var channels []*OpenChannel
 
@@ -386,6 +394,10 @@ func (d *DB) fetchNodeChannels(chainBucket *bbolt.Bucket) ([]*OpenChannel, error
 	err := chainBucket.ForEach(func(chanPoint, v []byte) error {
 		// If there's a value, it's not a bucket so ignore it.
 		if v != nil {
+			return nil
+		}
+
+		if bcBkt != nil && bcBkt.Get(chanPoint) != nil {
 			return nil
 		}
 
@@ -474,9 +486,22 @@ func (d *DB) FetchChannel(chanPoint wire.OutPoint) (*OpenChannel, error) {
 						"bucket for chain=%x", chainHash[:])
 				}
 
+
+                                nodeChans, err := d.fetchNodeChannels(tx, chainBucket)
+                                if err != nil {
+                                        return err
+                                }
+
+                                for _, channel := range nodeChans {
+                                        if channel.FundingOutpoint == chanPoint {
+                                                targetChan = channel
+                                        }
+                                }
+
+                                return nil
 				// Finally we reach the leaf bucket that stores
 				// all the chanPoints for this node.
-				chanBucket := chainBucket.Bucket(
+				/*chanBucket := chainBucket.Bucket(
 					targetChanPoint.Bytes(),
 				)
 				if chanBucket == nil {
@@ -493,7 +518,7 @@ func (d *DB) FetchChannel(chanPoint wire.OutPoint) (*OpenChannel, error) {
 				targetChan = channel
 				targetChan.Db = d
 
-				return nil
+				return nil */
 			})
 		})
 	}
@@ -620,7 +645,7 @@ func fetchChannels(d *DB, pending, waitingClose bool) ([]*OpenChannel, error) {
 						"bucket for chain=%x", chainHash[:])
 				}
 
-				nodeChans, err := d.fetchNodeChannels(chainBucket)
+				nodeChans, err := d.fetchNodeChannels(tx, chainBucket)
 				if err != nil {
 					return fmt.Errorf("unable to read "+
 						"channel for chain_hash=%x, "+

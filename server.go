@@ -665,6 +665,7 @@ func newServer(listenAddrs []net.Addr, chanDB *channeldb.DB, cc *chainControl,
 	s.utxoNursery = newUtxoNursery(&NurseryConfig{
 		ChainIO:             cc.chainIO,
 		ConfDepth:           1,
+		SecretKeyRing: cc.keyRing,
 		FetchClosedChannels: chanDB.FetchClosedChannels,
 		FetchClosedChannel:  chanDB.FetchClosedChannel,
 		Notifier:            cc.chainNotifier,
@@ -693,6 +694,7 @@ func newServer(listenAddrs []net.Addr, chanDB *channeldb.DB, cc *chainControl,
 		NewSweepAddr: func() ([]byte, error) {
 			return newSweepPkScript(cc.wallet)
 		},
+                SecretKeyRing: cc.keyRing,
 		PublishTx: cc.wallet.PublishTransaction,
 		DeliverResolutionMsg: func(msgs ...contractcourt.ResolutionMsg) error {
 			for _, msg := range msgs {
@@ -1034,32 +1036,41 @@ func (s *server) Start() error {
 	if err := s.breachArbiter.Start(); err != nil {
 		return err
 	}
-	if err := s.authGossiper.Start(); err != nil {
+	/*if err := s.authGossiper.Start(); err != nil {
 		return err
 	}
-	if err := s.chanRouter.Start(); err != nil {
+        if err := s.chanRouter.Start(); err != nil {
 		return err
 	}
 	if err := s.fundingMgr.Start(); err != nil {
 		return err
 	}
+        */
 	s.connMgr.Start()
 
 	if err := s.invoices.Start(); err != nil {
 		return err
 	}
-	if err := s.chanStatusMgr.Start(); err != nil {
+	/*if err := s.chanStatusMgr.Start(); err != nil {
 		return err
 	}
+*/
+        //return errors.New("exiting")
 
-	// With all the relevant sub-systems started, we'll now attempt to
+        select {
+        case <-(chan struct{})(nil):
+        case <-s.quit:
+                return errors.New("exiting")
+        }
+
+// With all the relevant sub-systems started, we'll now attempt to
 	// establish persistent connections to our direct channel collaborators
 	// within the network. Before doing so however, we'll prune our set of
 	// link nodes found within the database to ensure we don't reconnect to
 	// any nodes we no longer have open channels with.
-	if err := s.chanDB.PruneLinkNodes(); err != nil {
+/*	if err := s.chanDB.PruneLinkNodes(); err != nil {
 		return err
-	}
+	}*/
 	if err := s.establishPersistentConnections(); err != nil {
 		return err
 	}
@@ -1715,11 +1726,17 @@ func (s *server) establishPersistentConnections() error {
 	// each of the nodes.
 	selfPub := s.identityPriv.PubKey().SerializeCompressed()
 	err = sourceNode.ForEachChannel(nil, func(
-		tx *bbolt.Tx,
+                tx *bbolt.Tx,
 		chanInfo *channeldb.ChannelEdgeInfo,
 		policy, _ *channeldb.ChannelEdgePolicy) error {
 
-		// If the remote party has announced the channel to us, but we
+		defer func() {
+                     if r := recover(); r != nil {
+                        srvrLog.Errorf("recovered: %v", r)
+                     }
+                }()
+
+                // If the remote party has announced the channel to us, but we
 		// haven't yet, then we won't have a policy. However, we don't
 		// need this to connect to the peer, so we'll log it and move on.
 		if policy == nil {
@@ -1796,6 +1813,9 @@ func (s *server) establishPersistentConnections() error {
 		return err
 	}
 
+
+         return errors.New("exiting established")
+        
 	// Acquire and hold server lock until all persistent connection requests
 	// have been recorded and sent to the connection manager.
 	s.mu.Lock()
@@ -2427,7 +2447,7 @@ func (s *server) peerConnected(conn net.Conn, connReq *connmgr.ConnReq,
 	// We'll signal that we understand the data loss protection feature,
 	// and also that we support the new gossip query features.
 	localFeatures.Set(lnwire.DataLossProtectRequired)
-	localFeatures.Set(lnwire.GossipQueriesOptional)
+	//localFeatures.Set(lnwire.GossipQueriesOptional)
 
 	// Now that we've established a connection, create a peer, and it to
 	// the set of currently active peers.

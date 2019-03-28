@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"sync"
 	"sync/atomic"
-
+        "github.com/lightningnetwork/lnd/keychain"
 	"github.com/btcsuite/btcd/chaincfg/chainhash"
 	"github.com/btcsuite/btcd/wire"
 	"github.com/btcsuite/btcutil"
@@ -52,7 +52,7 @@ type ResolutionMsg struct {
 type ChainArbitratorConfig struct {
 	// ChainHash is the chain that this arbitrator is to operate within.
 	ChainHash chainhash.Hash
-
+        SecretKeyRing keychain.SecretKeyRing
 	// BroadcastDelta is the delta that we'll use to decide when to
 	// broadcast our commitment transaction.  This value should be set
 	// based on our current fee estimation of the commitment transaction.
@@ -173,7 +173,7 @@ type ChainArbitrator struct {
 	// cfg is the config struct for the arbitrator that contains all
 	// methods and interface it needs to operate.
 	cfg ChainArbitratorConfig
-
+	SecretKeyRing keychain.SecretKeyRing
 	// chanSource will be used by the ChainArbitrator to fetch all the
 	// active channels that it must still watch over.
 	chanSource *channeldb.DB
@@ -224,6 +224,7 @@ func newActiveChannelArbitrator(channel *channeldb.OpenChannel,
 	// all interfaces and methods the arbitrator needs to do its job.
 	arbCfg := ChannelArbitratorConfig{
 		ChanPoint:   chanPoint,
+                SecretKeyRing: c.SecretKeyRing,
 		ShortChanID: channel.ShortChanID(),
 		BlockEpochs: blockEpoch,
 		ForceCloseChan: func() (*lnwallet.LocalForceCloseSummary, error) {
@@ -414,6 +415,7 @@ func (c *ChainArbitrator) Start() error {
 			ChainEvents:           &ChainEventSubscription{},
 			IsPendingClose:        true,
 			ClosingHeight:         closeChanInfo.CloseHeight,
+			SecretKeyRing: c.SecretKeyRing,
 			CloseType:             closeChanInfo.CloseType,
 		}
 		chanLog, err := newBoltArbitratorLog(

@@ -97,6 +97,15 @@ func (c *commitSweepResolver) Resolve() (ContractResolver, error) {
 		// With our input constructed, we'll now offer it to the
 		// sweeper.
 		log.Infof("%T(%v): sweeping commit output", c, c.chanPoint)
+		
+		 _, err = c.ChannelArbitratorConfig.SecretKeyRing.DerivePrivKey(
+              	c.commitResolution.SelfOutputSignDesc.KeyDesc,
+          	)
+          		if err != nil {
+              		return nil, err
+        	  }
+
+	         // SweepInput should be right below this
 
 		resultChan, err := c.Sweeper.SweepInput(&inp)
 		if err != nil {

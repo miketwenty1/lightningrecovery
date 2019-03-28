@@ -5,7 +5,7 @@ import (
 	"errors"
 	"sync"
 	"sync/atomic"
-
+        "github.com/lightningnetwork/lnd/keychain"
 	"github.com/btcsuite/btcd/wire"
 	"github.com/btcsuite/btcutil"
 	"github.com/davecgh/go-spew/spew"
@@ -80,7 +80,7 @@ type ChannelArbitratorConfig struct {
 	// chain. We'll use this to address any messages that we need to send
 	// to the switch during contract resolution.
 	ShortChanID lnwire.ShortChannelID
-
+        SecretKeyRing keychain.SecretKeyRing
 	// BlockEpochs is an active block epoch event stream backed by an
 	// active ChainNotifier instance. We will use new block notifications
 	// sent over this channel to decide when we should go on chain to

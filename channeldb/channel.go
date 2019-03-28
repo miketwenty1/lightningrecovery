@@ -73,6 +73,8 @@ var (
 	// channel closure. This key should be accessed from within the
 	// sub-bucket of a target channel, identified by its channel point.
 	revocationLogBucket = []byte("revocation-log-key")
+
+	borkedChannelBucket = []byte("borked-channel-key")
 )
 
 var (
@@ -695,6 +697,19 @@ func (c *OpenChannel) MarkAsOpen(openLoc lnwire.ShortChannelID) error {
 			return err
 		}
 
+		bcBkt := tx.Bucket(borkedChannelBucket)
+		if bcBkt != nil {
+			var chanPointBuf bytes.Buffer
+			err := writeOutpoint(&chanPointBuf, &c.FundingOutpoint)
+			if err != nil {
+				return err
+			}
+
+			if bcBkt.Get(chanPointBuf.Bytes()) != nil {
+				return ErrNoChanInfoFound
+			}
+		}
+
 		channel, err := fetchOpenChannel(chanBucket, &c.FundingOutpoint)
 		if err != nil {
 			return err
@@ -729,6 +744,19 @@ func (c *OpenChannel) MarkDataLoss(commitPoint *btcec.PublicKey) error {
 		)
 		if err != nil {
 			return err
+		}
+
+		bcBkt := tx.Bucket(borkedChannelBucket)
+		if bcBkt != nil {
+			var chanPointBuf bytes.Buffer
+			err := writeOutpoint(&chanPointBuf, &c.FundingOutpoint)
+			if err != nil {
+				return err
+			}
+
+			if bcBkt.Get(chanPointBuf.Bytes()) != nil {
+				return ErrNoChanInfoFound
+			}
 		}
 
 		channel, err := fetchOpenChannel(chanBucket, &c.FundingOutpoint)
@@ -824,6 +852,19 @@ func (c *OpenChannel) putChanStatus(status ChannelStatus) error {
 		)
 		if err != nil {
 			return err
+		}
+
+		bcBkt := tx.Bucket(borkedChannelBucket)
+		if bcBkt != nil {
+			var chanPointBuf bytes.Buffer
+			err := writeOutpoint(&chanPointBuf, &c.FundingOutpoint)
+			if err != nil {
+				return err
+			}
+
+			if bcBkt.Get(chanPointBuf.Bytes()) != nil {
+				return ErrNoChanInfoFound
+			}
 		}
 
 		channel, err := fetchOpenChannel(chanBucket, &c.FundingOutpoint)
@@ -1989,6 +2030,17 @@ func (c *OpenChannel) CloseChannel(summary *ChannelCloseSummary) error {
 			return err
 		}
 
+		bcBkt, err := tx.CreateBucketIfNotExists(borkedChannelBucket)
+		if err != nil {
+			return err
+		}
+
+		err = bcBkt.Put(chanPointBuf.Bytes(), []byte{})
+		if err != nil {
+			return err
+		}
+
+		/*
 		// Now that the index to this channel has been deleted, purge
 		// the remaining channel metadata from the database.
 		err = deleteOpenChannel(chanBucket, chanPointBuf.Bytes())
@@ -2000,8 +2052,7 @@ func (c *OpenChannel) CloseChannel(summary *ChannelCloseSummary) error {
 		// information stored within the revocation log.
 		logBucket := chanBucket.Bucket(revocationLogBucket)
 		if logBucket != nil {
-			err := wipeChannelLogEntries(logBucket)
-			if err != nil {
+                        err := wipeChannelLogEntries(logBucket)
 				return err
 			}
 			err = chanBucket.DeleteBucket(revocationLogBucket)
@@ -2014,6 +2065,7 @@ func (c *OpenChannel) CloseChannel(summary *ChannelCloseSummary) error {
 		if err != nil {
 			return err
 		}
+		*/
 
 		// Finally, create a summary of this channel in the closed
 		// channel bucket for this node.

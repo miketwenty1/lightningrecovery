@@ -964,7 +964,7 @@ func (p *peer) readHandler() {
 	//
 	// TODO(conner): have peer store gossip syncer directly and bypass
 	// gossiper?
-	p.initGossipSync()
+	//p.initGossipSync()
 
 	discStream := newDiscMsgStream(p)
 	discStream.Start()

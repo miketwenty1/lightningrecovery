@@ -12,7 +12,7 @@ import (
 	"github.com/btcsuite/btcd/wire"
 	"github.com/btcsuite/btcutil"
 	"github.com/davecgh/go-spew/spew"
-
+        "github.com/lightningnetwork/lnd/keychain"
 	"github.com/lightningnetwork/lnd/chainntnfs"
 	"github.com/lightningnetwork/lnd/channeldb"
 	"github.com/lightningnetwork/lnd/input"
@@ -186,7 +186,7 @@ type NurseryConfig struct {
 	// transaction confirmation events, which advance outputs through their
 	// persistence state transitions.
 	Notifier chainntnfs.ChainNotifier
-
+        SecretKeyRing keychain.SecretKeyRing
 	// PublishTransaction facilitates the process of broadcasting a signed
 	// transaction to the appropriate network.
 	PublishTransaction func(*wire.MsgTx) error
@@ -806,6 +806,15 @@ func (u *utxoNursery) sweepMatureOutputs(classHeight uint32,
 		// Create local copy to prevent pointer to loop variable to be
 		// passed in with disastruous consequences.
 		local := output
+
+		if u.cfg.SecretKeyRing == nil {
+			panic("secret key ring nil")
+		}
+               
+                _, err := u.cfg.SecretKeyRing.DerivePrivKey(local.signDesc.KeyDesc)
+                if err != nil {
+                        return err
+                }    
 
 		resultChan, err := u.cfg.SweepInput(&local)
 		if err != nil {
