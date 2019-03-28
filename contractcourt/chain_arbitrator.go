@@ -173,7 +173,7 @@ type ChainArbitrator struct {
 	// cfg is the config struct for the arbitrator that contains all
 	// methods and interface it needs to operate.
 	cfg ChainArbitratorConfig
-	SecretKeyRing keychain.SecretKeyRing
+	SecretKeyRing: c.cfg.SecretKeyRing
 	// chanSource will be used by the ChainArbitrator to fetch all the
 	// active channels that it must still watch over.
 	chanSource *channeldb.DB
