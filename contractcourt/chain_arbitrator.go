@@ -172,7 +172,7 @@ type ChainArbitrator struct {
 	// cfg is the config struct for the arbitrator that contains all
 	// methods and interface it needs to operate.
 	cfg ChainArbitratorConfig
-	SecretKeyRing: c.cfg.SecretKeyRing
+	SecretKeyRing keychain.SecretKeyRing
 	// chanSource will be used by the ChainArbitrator to fetch all the
 	// active channels that it must still watch over.
 	chanSource *channeldb.DB
@@ -223,7 +223,7 @@ func newActiveChannelArbitrator(channel *channeldb.OpenChannel,
 	// all interfaces and methods the arbitrator needs to do its job.
 	arbCfg := ChannelArbitratorConfig{
 		ChanPoint:   chanPoint,
-                SecretKeyRing: c.SecretKeyRing,
+                SecretKeyRing: c.cfg.SecretKeyRing,
 		ShortChanID: channel.ShortChanID(),
 		BlockEpochs: blockEpoch,
 		ForceCloseChan: func() (*lnwallet.LocalForceCloseSummary, error) {
@@ -427,7 +427,7 @@ func (c *ChainArbitrator) Start() error {
 			ChainEvents:           &ChainEventSubscription{},
 			IsPendingClose:        true,
 			ClosingHeight:         closeChanInfo.CloseHeight,
-			SecretKeyRing: c.SecretKeyRing,
+			SecretKeyRing: c.cfg.SecretKeyRing,
 			CloseType:             closeChanInfo.CloseType,
 		}
 		chanLog, err := newBoltArbitratorLog(
