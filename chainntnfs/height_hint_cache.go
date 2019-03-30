@@ -105,6 +105,19 @@ func NewHeightHintCache(db *channeldb.DB) (*HeightHintCache, error) {
 // initialized so that we can assume their existence after startup.
 func (c *HeightHintCache) initBuckets() error {
 	return c.db.Update(func(tx *bolt.Tx) error {
+		if tx.Bucket(spendHintBucket) != nil {
+			err := tx.DeleteBucket(spendHintBucket)
+			if err != nil {
+				return err
+			}
+		}
+		if tx.Bucket(confirmHintBucket) != nil {
+			err := tx.DeleteBucket(confirmHintBucket)
+			if err != nil {
+				return err
+			}
+		}
+
 		_, err := tx.CreateBucketIfNotExists(spendHintBucket)
 		if err != nil {
 			return err
