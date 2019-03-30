@@ -51,5 +51,6 @@ When you run lnd, hopefully you will be able to close channels, see pending chan
 Example command to send coins off.<br>
 `lncli sendcoins --addr=[BTC address] --sweepall`<br>
 Hopefully you never are in this situation, but if you are.. hopefully you see some numbers in `lncli walletbalance`. 
-Good luck!
-
+Good luck!<br>
+<br>
+Special Thanks to Conner Fromknecht
