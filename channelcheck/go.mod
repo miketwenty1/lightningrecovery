@@ -9,4 +9,4 @@ require (
 	golang.org/x/crypto v0.0.0-20190219172222-a4c6cb3142f2 // indirect
 )
 
-replace github.com/lightningnetwork/lnd => /home/tidwell/gocode/src/github.com/lightningnetwork/lnd
+replace github.com/lightningnetwork/lnd => /home/user/gocode/src/github.com/lightningnetwork/lnd
