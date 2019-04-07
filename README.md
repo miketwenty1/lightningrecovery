@@ -21,7 +21,8 @@ First thing we will want to do is see if we can parse the `channel.db` and find 
 `cp ~/.lnd/data/graph/mainnet/channel.db ~/gocode/src/github.com/miketwenty1/lightningrecovery/channelcheck/`<br>
 _Path to your channel.db may vary based on your setup_<br>
 `cd ~/gocode/src/github.com/miketwenty1/lightningrecovery/channelcheck/`<br>
-`ls` make sure your `channel.db` is in this directory
+Change line 12 in `go.mod` to be the path of your lnd <br>
+`ls` make sure your `channel.db` is in this directory <br>
 `./main`<br>
 Hopefully you will see Channel information along with a summation totaled at the bottom. <br>
 You should only expect to recover this amount of less.<br>
