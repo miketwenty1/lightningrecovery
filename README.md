@@ -18,9 +18,9 @@ See this issue for reference on the situation. https://github.com/lightningnetwo
 
 ## Check corrupted channel.db with channelcheck
 First thing we will want to do is see if we can parse the `channel.db` and find funds.<br>
-`cp ~/.lnd/data/graph/mainnet/channel.db ~/gocode/src/github.com/miketwenty1/lightningrecovery/channelbackup/`<br>
+`cp ~/.lnd/data/graph/mainnet/channel.db ~/gocode/src/github.com/miketwenty1/lightningrecovery/channelcheck/`<br>
 _Path to your channel.db may vary based on your setup_<br>
-`cd ~/gocode/src/github.com/miketwenty1/lightningrecovery/channelbackup/`<br>
+`cd ~/gocode/src/github.com/miketwenty1/lightningrecovery/channelcheck/`<br>
 `ls` make sure your `channel.db` is in this directory
 `./main`<br>
 Hopefully you will see Channel information along with a summation totaled at the bottom. <br>
