@@ -11,6 +11,7 @@ See this issue for reference on the situation. https://github.com/lightningnetwo
   * `go get -d github.com/miketwenty1/lightningrecovery`
   * `cd ~/gocode/src/github.com/miketwenty1/lightningrecovery`
   * `git checkout -b [Descriptive Branch]`
+* If you follow these steps, make sure to `git rm` any sensitive files like your channel.db from channelcheck directory.
 
 ## When using this repo I recommend making a complete copy of your .lnd directory.
 `mkdir ~/recoverybkp` <br>
