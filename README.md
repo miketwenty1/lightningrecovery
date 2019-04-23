@@ -1,3 +1,4 @@
+# Please refer the recovery method posted [Here](https://github.com/lightningnetwork/lnd/blob/master/docs/recovery.md) before attempting to solve your issues with this repo. Granted this was used before version 0.6.0 
 # Recover funds off a LND node that has a corrupted channel.db.
 See this issue for reference on the situation. https://github.com/lightningnetwork/lnd/issues/2825
 
